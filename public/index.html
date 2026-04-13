@@ -65,7 +65,7 @@ label.field input, label.field select { padding:7px 9px; background:var(--panel)
 .status.cancelled { background:#3a3a3a; color:#999; }
 .bar { height:6px; background:var(--border); border-radius:3px; overflow:hidden; }
 .bar > div { height:100%; background:linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.3s; }
-.job-meta { display:flex; gap:12px; font-size:11px; color:var(--muted); margin-top:6px; }
+.job-meta { display:flex; gap:12px; font-size:11px; color:var(--muted); margin-top:6px; flex-wrap:wrap; }
 .empty { color:var(--muted); text-align:center; padding:30px 10px; font-size:13px; }
 .crumbs { padding:6px 12px; font-size:12px; }
 .crumbs a { color:var(--accent-2); text-decoration:none; cursor:pointer; }
@@ -75,6 +75,18 @@ label.field input, label.field select { padding:7px 9px; background:var(--panel)
 .tab.active { color:var(--text); background:var(--panel); border-color:var(--accent); }
 .sizes { font-size:11px; color:var(--muted); }
 .shrink { color:var(--good); font-weight:600; }
+.grow { color:var(--warn); font-weight:600; }
+.presets { display:flex; gap:6px; margin-bottom:14px; flex-wrap:wrap; }
+.preset-btn { padding:6px 10px; background:var(--panel); border:1px solid var(--border); color:var(--text); border-radius:6px; font-size:12px; cursor:pointer; }
+.preset-btn:hover { border-color:var(--accent); }
+.preset-btn.active { background:var(--accent); border-color:var(--accent); color:white; }
+.estimate { background:linear-gradient(135deg, #1a2538, #1f2d44); border:1px solid #2d4066; border-radius:8px; padding:12px 14px; margin-top:14px; font-size:13px; }
+.estimate-row { display:flex; justify-content:space-between; align-items:center; }
+.estimate-row + .estimate-row { margin-top:6px; }
+.estimate-label { color:var(--muted); font-size:12px; }
+.estimate-value { font-weight:600; font-size:14px; }
+.estimate-note { color:var(--muted); font-size:11px; margin-top:8px; padding-top:8px; border-top:1px solid #2d4066; }
+.advice { color:var(--warn); font-size:12px; margin-top:8px; display:flex; gap:6px; align-items:flex-start; }
 </style>
 </head>
 <body>
@@ -126,6 +138,151 @@ function fmtDur(s) {
   return h ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`;
 }
 
+// ---- Size estimation ----
+// Approximate x264 bitrate curve (kbps) at 1080p, slow preset, live-action.
+// Animation/flat content will come out smaller; heavy grain will come out larger.
+function estimateVideoBitrateKbps(crf, width, height, sourceCodec) {
+  const ref1080 = {
+    14: 18000, 16: 13000, 18: 9000, 19: 7500,
+    20: 6000, 21: 5000, 22: 4200, 23: 3500,
+    24: 2900, 25: 2400, 26: 2000, 27: 1700,
+    28: 1400, 29: 1200, 30: 1000
+  };
+  const crfClamped = Math.max(14, Math.min(30, crf));
+  const lo = Math.floor(crfClamped), hi = Math.ceil(crfClamped);
+  const frac = crfClamped - lo;
+  const base = ref1080[lo] * (1 - frac) + ref1080[hi] * frac;
+
+  const pixels = (width || 1920) * (height || 1080);
+  const refPixels = 1920 * 1080;
+  let scaled = base * (pixels / refPixels);
+
+  // HEVC sources tend to preserve more grain/detail, so x264 needs slightly more bits
+  if (sourceCodec === 'hevc' || sourceCodec === 'h265') scaled *= 1.1;
+
+  return scaled;
+}
+
+function estimateOutputSize() {
+  if (!state.probe) return null;
+  const checks = [...document.querySelectorAll('#tracks input[type=checkbox]')];
+  const keptVideo = checks.find(c => c.checked && c.dataset.type === 'video');
+  if (!keptVideo) return null;
+  const vStream = state.probe.streams.find(s => s.index === parseInt(keptVideo.dataset.idx, 10));
+  if (!vStream) return null;
+
+  const duration = state.probe.format.duration || 0;
+  if (!duration) return null;
+
+  const crf = parseInt(document.getElementById('crf').value, 10);
+  const maxH = document.getElementById('maxHeight').value;
+  let width = vStream.width || 1920, height = vStream.height || 1080;
+  if (maxH) {
+    const target = parseInt(maxH, 10);
+    if (height > target) {
+      width = Math.round(width * (target / height));
+      height = target;
+    }
+  }
+
+  const videoKbps = estimateVideoBitrateKbps(crf, width, height, vStream.codec_name);
+
+  const audioMode = document.getElementById('audioMode').value;
+  const audioBitrateVal = parseInt(document.getElementById('audioBitrate').value, 10);
+  let audioKbps = 0;
+  const keptAudio = checks.filter(c => c.checked && c.dataset.type === 'audio');
+  for (const c of keptAudio) {
+    const s = state.probe.streams.find(st => st.index === parseInt(c.dataset.idx, 10));
+    if (audioMode === 'copy' && s && s.bit_rate) {
+      audioKbps += parseInt(s.bit_rate, 10) / 1000;
+    } else {
+      audioKbps += audioBitrateVal;
+    }
+  }
+
+  const totalKbps = videoKbps + audioKbps;
+  const bytes = (totalKbps * 1000 / 8) * duration;
+  return { bytes, videoKbps: Math.round(videoKbps), audioKbps: Math.round(audioKbps), width, height };
+}
+
+function updateEstimate() {
+  const el = document.getElementById('estimate');
+  if (!el) return;
+  const est = estimateOutputSize();
+  if (!est) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  const inputSize = state.probe.format.size;
+  const delta = inputSize ? ((1 - est.bytes / inputSize) * 100) : 0;
+  const deltaClass = delta >= 5 ? 'shrink' : (delta <= -5 ? 'grow' : '');
+  const deltaText = delta >= 0 ? `-${delta.toFixed(0)}%` : `+${Math.abs(delta).toFixed(0)}%`;
+
+  let advice = '';
+  if (delta < 0) {
+    advice = `<div class="advice">⚠️ Output will be <b>larger</b> than the source. Increase CRF (23–26) or downscale resolution to actually shrink the file.</div>`;
+  } else if (delta < 10) {
+    advice = `<div class="advice">⚠️ Only minor savings expected. Try CRF 23+ or the "Shrink hard" preset for meaningful compression.</div>`;
+  }
+
+  el.innerHTML = `
+    <div class="estimate-row">
+      <span class="estimate-label">Estimated output size</span>
+      <span class="estimate-value">${fmtBytes(est.bytes)} <span class="${deltaClass}" style="font-size:12px;margin-left:6px">${deltaText}</span></span>
+    </div>
+    <div class="estimate-row">
+      <span class="estimate-label">Source size</span>
+      <span class="estimate-value" style="color:var(--muted);font-weight:500">${fmtBytes(inputSize)}</span>
+    </div>
+    <div class="estimate-row">
+      <span class="estimate-label">Target bitrate</span>
+      <span class="estimate-value" style="font-weight:500">${(est.videoKbps/1000).toFixed(1)} Mbps video + ${est.audioKbps} kbps audio</span>
+    </div>
+    <div class="estimate-note">Estimate based on typical x264 CRF behavior. Real output can vary ±30% depending on content (animation shrinks more, heavy grain/noise less).</div>
+    ${advice}
+  `;
+}
+
+// ---- Recommended presets ----
+function getRecommendations(probe) {
+  if (!probe) return [];
+  const v = probe.streams.find(s => s.codec_type === 'video');
+  const srcCodec = v ? v.codec_name : 'h264';
+  const srcH = v ? v.height : 1080;
+  const isHEVC = srcCodec === 'hevc' || srcCodec === 'h265';
+
+  const recs = [];
+
+  if (isHEVC) {
+    recs.push({ id: 'archival', name: 'Archival quality', desc: 'Near-lossless. File may grow vs HEVC source.',
+      crf: 20, preset: 'slow', maxHeight: '' });
+    recs.push({ id: 'balanced', name: 'Balanced', desc: 'Good quality, roughly matches source size.',
+      crf: 23, preset: 'slow', maxHeight: '' });
+    recs.push({ id: 'shrink', name: 'Shrink hard', desc: '~40–50% smaller, streaming quality.',
+      crf: 25, preset: 'slow', maxHeight: '' });
+  } else {
+    recs.push({ id: 'light', name: 'Light compression', desc: 'Small savings, visually lossless.',
+      crf: 22, preset: 'slow', maxHeight: '' });
+    recs.push({ id: 'balanced', name: 'Balanced', desc: '~30–40% smaller, excellent quality.',
+      crf: 24, preset: 'slow', maxHeight: '' });
+    recs.push({ id: 'shrink', name: 'Shrink hard', desc: '~50–60% smaller, streaming quality.',
+      crf: 26, preset: 'slow', maxHeight: '' });
+  }
+
+  if (srcH && srcH > 1440) {
+    recs.push({ id: 'downscale', name: '1080p downscale', desc: 'Big size cut, great for streaming.',
+      crf: 23, preset: 'slow', maxHeight: '1080' });
+  }
+
+  return recs;
+}
+
+function applyPreset(p) {
+  document.getElementById('crf').value = p.crf;
+  document.getElementById('preset').value = p.preset;
+  document.getElementById('maxHeight').value = p.maxHeight;
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.toggle('active', b.dataset.id === p.id));
+  updateEstimate();
+}
+
 async function browse(p) {
   const r = await fetch('/api/browse?path=' + encodeURIComponent(p || ''));
   const data = await r.json();
@@ -162,18 +319,18 @@ function renderFiles(items) {
     const li = document.createElement('li');
     const icon = it.dir ? '📁' : (it.name.toLowerCase().match(/\.(mkv|mp4|avi|mov|webm|ts|m4v)$/) ? '🎬' : '📄');
     li.innerHTML = `<span class="name"><span class="icon">${icon}</span>${it.name}</span><span class="size">${it.dir ? '' : fmtBytes(it.size)}</span>`;
-    li.onclick = () => {
+    li.onclick = (ev) => {
       if (it.dir) browse(it.path);
-      else selectFile(it);
+      else selectFile(it, ev);
     };
     ul.appendChild(li);
   }
 }
 
-async function selectFile(file) {
+async function selectFile(file, ev) {
   state.selected = file;
   document.querySelectorAll('.file-list li').forEach(l => l.classList.remove('selected'));
-  event.currentTarget.classList.add('selected');
+  if (ev && ev.currentTarget) ev.currentTarget.classList.add('selected');
   const panel = document.getElementById('selectedPanel');
   panel.innerHTML = `<h2>${file.name}</h2><div class="empty">Probing tracks...</div>`;
   const r = await fetch('/api/probe?path=' + encodeURIComponent(file.path));
@@ -186,13 +343,24 @@ async function selectFile(file) {
 function renderProbe(file, data) {
   const panel = document.getElementById('selectedPanel');
   const subs = data.streams.filter(s => s.codec_type === 'subtitle');
+  const videoStream = data.streams.find(s => s.codec_type === 'video');
+  const srcCodec = videoStream ? videoStream.codec_name : 'unknown';
+  const recs = getRecommendations(data);
+
   panel.innerHTML = `
     <h2>${file.name}</h2>
     <div class="sizes">
-      ${fmtBytes(data.format.size)} · ${fmtDur(data.format.duration)} · ${data.format.format_name || ''}
+      ${fmtBytes(data.format.size)} · ${fmtDur(data.format.duration)} · source codec: <b style="color:var(--text)">${srcCodec}</b>${videoStream && videoStream.width ? ` · ${videoStream.width}×${videoStream.height}` : ''}
     </div>
+
+    <div style="margin:16px 0 6px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.6px">Recommended settings</div>
+    <div class="presets" id="presets">
+      ${recs.map(r => `<button class="preset-btn" data-id="${r.id}" title="${r.desc}"><b>${r.name}</b> · CRF ${r.crf}${r.maxHeight ? ` · ${r.maxHeight}p` : ''}</button>`).join('')}
+    </div>
+
     <div style="margin:14px 0 8px;font-size:13px;color:var(--muted)">Tracks (check to keep)</div>
     <div id="tracks"></div>
+
     <div style="margin-top:18px" class="grid">
       <label class="field">Quality (CRF) <input type="number" id="crf" value="20" min="14" max="30" step="1"></label>
       <label class="field">Preset
@@ -234,15 +402,20 @@ function renderProbe(file, data) {
         <input type="text" id="outputName" value="${file.name.replace(/\.[^.]+$/, '')}.mp4">
       </label>
     </div>
+
     <div id="burnPick" style="display:none;margin-top:10px"></div>
+
+    <div class="estimate" id="estimate" style="display:none"></div>
+
     <div style="margin-top:16px;display:flex;gap:8px">
       <button id="convertBtn">Start Conversion</button>
       <button class="ghost" id="refreshBtn">Re-probe</button>
     </div>
     <div style="margin-top:10px;font-size:11px;color:var(--muted)">
-      Tip: CRF 18–20 is visually lossless for most content. CRF 23 is YouTube-quality. Lower = bigger file. Slower preset = smaller file at same quality.
+      Tip: CRF 18–20 is visually lossless. CRF 23–25 is streaming-quality at about half the size. Slower preset = smaller file at same quality.
     </div>
   `;
+
   const tracksEl = document.getElementById('tracks');
   for (const s of data.streams) {
     const type = ['video','audio','subtitle'].includes(s.codec_type) ? s.codec_type : 'other';
@@ -250,11 +423,11 @@ function renderProbe(file, data) {
     let info = `<strong>${s.codec_name || '?'}</strong>`;
     if (s.codec_type === 'video' && s.width) info += ` · ${s.width}×${s.height}`;
     if (s.codec_type === 'audio') info += ` · ${s.channels || '?'}ch ${s.channel_layout || ''}`;
+    if (s.bit_rate) info += ` · ${Math.round(s.bit_rate/1000)} kbps`;
     info += ` · lang: ${s.language}`;
     if (s.title) info += ` · "${s.title}"`;
     if (s.default) info += ' · default';
     if (s.forced) info += ' · forced';
-    // default select: video + default audio + default subtitle (if any)
     const defaultCheck = s.codec_type === 'video' || (s.codec_type === 'audio' && s.default)
       || (s.codec_type === 'audio' && s.language === 'eng') || (s.codec_type === 'subtitle' && s.default);
     const id = 'trk_' + s.index;
@@ -264,7 +437,23 @@ function renderProbe(file, data) {
                      ${badge}<span class="meta">#${s.index} ${info}</span>`;
     tracksEl.appendChild(row);
   }
-  // burn-in sub picker
+
+  // Preset buttons
+  document.querySelectorAll('.preset-btn').forEach(btn => {
+    btn.onclick = () => {
+      const r = recs.find(x => x.id === btn.dataset.id);
+      if (r) applyPreset(r);
+    };
+  });
+
+  // Live estimate updates
+  ['crf','preset','audioMode','audioBitrate','subtitleMode','maxHeight'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', updateEstimate);
+    if (el && el.tagName === 'INPUT') el.addEventListener('input', updateEstimate);
+  });
+  document.querySelectorAll('#tracks input[type=checkbox]').forEach(c => c.addEventListener('change', updateEstimate));
+
   const subSel = document.getElementById('subtitleMode');
   subSel.onchange = () => {
     const pick = document.getElementById('burnPick');
@@ -274,14 +463,21 @@ function renderProbe(file, data) {
         subs.map(s => `<option value="${s.index}">#${s.index} ${s.codec_name} (${s.language})${s.title ? ' — ' + s.title : ''}</option>`).join('') +
         `</select></label>`;
     } else pick.style.display = 'none';
+    updateEstimate();
   };
+
   document.getElementById('refreshBtn').onclick = () => selectFileRefresh(file);
   document.getElementById('convertBtn').onclick = () => startConvert(file);
+
+  // Auto-apply Balanced preset
+  const defaultPreset = recs.find(r => r.id === 'balanced') || recs[0];
+  if (defaultPreset) applyPreset(defaultPreset);
+  else updateEstimate();
 }
 
 function selectFileRefresh(file) {
   fetch('/api/probe?path=' + encodeURIComponent(file.path)).then(r => r.json()).then(d => {
-    if (!d.error) renderProbe(file, d);
+    if (!d.error) { state.probe = d; renderProbe(file, d); }
   });
 }
 
@@ -315,8 +511,18 @@ function renderJobs() {
   const el = document.getElementById('jobs');
   if (!state.jobs.length) { el.innerHTML = '<div class="empty">No jobs yet.</div>'; return; }
   el.innerHTML = state.jobs.map(j => {
-    const shrink = j.outputSize && j.inputSize ? ` · <span class="shrink">-${Math.round((1 - j.outputSize/j.inputSize)*100)}%</span>` : '';
-    const sizes = j.outputSize ? `${fmtBytes(j.inputSize)} → ${fmtBytes(j.outputSize)}${shrink}` : fmtBytes(j.inputSize);
+    const running = j.status === 'running';
+    let sizeText;
+    if (j.outputSize) {
+      const pct = Math.round((1 - j.outputSize/j.inputSize)*100);
+      const cls = pct > 0 ? 'shrink' : 'grow';
+      const sign = pct > 0 ? '-' : '+';
+      sizeText = `${fmtBytes(j.inputSize)} → ${fmtBytes(j.outputSize)} <span class="${cls}">${sign}${Math.abs(pct)}%</span>`;
+    } else if (running) {
+      sizeText = `source: ${fmtBytes(j.inputSize)} (output size known when complete)`;
+    } else {
+      sizeText = fmtBytes(j.inputSize);
+    }
     return `<div class="job">
       <div class="job-head">
         <div class="job-name">${j.input.split('/').pop()}</div>
@@ -328,7 +534,7 @@ function renderJobs() {
         ${j.speed ? `<span>${j.speed}x</span>` : ''}
         ${j.fps ? `<span>${j.fps} fps</span>` : ''}
         ${j.eta ? `<span>ETA ${fmtDur(j.eta)}</span>` : ''}
-        <span>${sizes}</span>
+        <span>${sizeText}</span>
         ${j.error ? `<span style="color:var(--err)">${j.error}</span>` : ''}
       </div>
       <div style="margin-top:8px;display:flex;gap:6px">
@@ -353,7 +559,6 @@ function showTab(name) {
 }
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => showTab(t.dataset.tab));
 
-// WebSocket for live progress
 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
 const ws = new WebSocket(`${proto}://${location.host}/ws`);
 ws.onmessage = ev => {
