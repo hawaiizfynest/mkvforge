@@ -1,7 +1,6 @@
 # MKVForge - MKV to MP4 converter with optional hardware encoding
 FROM node:20-bookworm-slim AS build
 
-# Build deps for better-sqlite3 native module
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python3 make g++ ca-certificates && \
@@ -11,10 +10,19 @@ WORKDIR /build
 COPY server/package.json ./package.json
 RUN npm install --omit=dev
 
-# ---------- Runtime image ----------
+# ---------- Runtime ----------
 FROM node:20-bookworm-slim
 
-RUN apt-get update && \
+# Enable contrib + non-free repos (needed for intel-media-va-driver-non-free).
+# Bookworm uses the new deb822 sources format at /etc/apt/sources.list.d/debian.sources.
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's/main$/main contrib non-free non-free-firmware/' /etc/apt/sources.list; \
+    fi; \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates tini gosu \
         ffmpeg \
